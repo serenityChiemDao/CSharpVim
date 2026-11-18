@@ -8,6 +8,9 @@ class MiniVim
     static readonly List<string> Lines = new() { "" };
     static int x, y, scroll;
     static bool insertMode, dirty;
+    enum VisualMode { None, Character, Line, Block }
+    static VisualMode visualMode;
+    static int anchorX, anchorY;
     static string fileName = "";
     static string message = "Press i to insert, :w to save, :q to quit.";
     static string command = "";
@@ -38,6 +41,10 @@ class MiniVim
                 if (insertMode)
                 {
                     HandleInsert(key);
+                }
+                else if (visualMode != VisualMode.None)
+                {
+                    HandleVisual(key);
                 }
                 else
                 {
@@ -146,6 +153,15 @@ class MiniVim
                     case 'k': MoveVertical(-1); break;
                     case '0': x = 0; break;
                     case '$': x = Math.Max(0, Lines[y].Length - 1); break;
+                    case 'v':
+                        StartVisual(VisualMode.Character);
+                        break;
+                    case 'V':
+                        StartVisual(VisualMode.Line);
+                        break;
+                    case '\u0016': // Ctrl+V
+                        StartVisual(VisualMode.Block);
+                        break;
                     case 'i':
                         insertMode = true;
                         message = "-- INSERT --";
@@ -179,6 +195,119 @@ class MiniVim
         x = Math.Clamp(x, 0, Math.Max(0, Lines[y].Length - 1));
         return false;
     }
+
+    static void StartVisual(VisualMode mode)
+    {
+        visualMode = mode;
+        anchorX = x;
+        anchorY = y;
+        message = mode switch
+        {
+            VisualMode.Character => "-- VISUAL -- (v to select, Esc to cancel)",
+            VisualMode.Line => "-- VISUAL LINE -- (V to select, Esc to cancel)",
+            _ => "-- VISUAL BLOCK -- (Ctrl+V to select, Esc to cancel)"
+        };
+    }
+
+    static void HandleVisual(ConsoleKeyInfo key)
+    {
+        if (key.Key == ConsoleKey.Escape)
+        {
+            visualMode = VisualMode.None;
+            message = "-- NORMAL --";
+            return;
+        }
+
+        switch (key.Key)
+        {
+            case ConsoleKey.LeftArrow: MoveLeft(); break;
+            case ConsoleKey.RightArrow: MoveRight(); break;
+            case ConsoleKey.UpArrow: MoveVertical(-1); break;
+            case ConsoleKey.DownArrow: MoveVertical(1); break;
+            default:
+                switch (key.KeyChar)
+                {
+                    case 'h': MoveLeft(); break;
+                    case 'l': MoveRight(); break;
+                    case 'j': MoveVertical(1); break;
+                    case 'k': MoveVertical(-1); break;
+                    case '0': x = 0; break;
+                    case '$': x = Math.Max(0, Lines[y].Length - 1); break;
+                }
+                break;
+        }
+
+        x = Math.Clamp(x, 0, Math.Max(0, Lines[y].Length - 1));
+        message = visualMode switch
+        {
+            VisualMode.Character => "-- VISUAL --",
+            VisualMode.Line => "-- VISUAL LINE --",
+            _ => "-- VISUAL BLOCK --"
+        };
+    }
+
+    static void AppendLineWithSelection(StringBuilder output, string line, int lineIndex, int available)
+    {
+        int visibleLength = Math.Min(line.Length, available);
+
+        for (int column = 0; column < visibleLength; column++)
+        {
+            bool selected = IsSelected(lineIndex, column);
+            if (selected) output.Append("\x1b[30;103m");
+            output.Append(line[column]);
+            if (selected) output.Append("\x1b[0m");
+        }
+
+        // Make an empty selected line visible, and show selected space beyond
+        // the end of a short line in Visual Line / Visual Block mode.
+        if (visualMode == VisualMode.Line && IsSelectedLine(lineIndex))
+        {
+            for (int column = visibleLength; column < available; column++)
+                output.Append("\x1b[30;103m \x1b[0m");
+        }
+        else if (visualMode == VisualMode.Block && IsSelectedBlockLine(lineIndex))
+        {
+            int left = Math.Min(anchorX, x);
+            int right = Math.Min(Math.Max(anchorX, x), available - 1);
+            for (int column = visibleLength; column <= right; column++)
+            {
+                if (column >= left) output.Append("\x1b[30;103m \x1b[0m");
+                else output.Append(' ');
+            }
+        }
+    }
+
+    static bool IsSelected(int lineIndex, int column)
+    {
+        if (visualMode == VisualMode.None) return false;
+
+        if (visualMode == VisualMode.Line)
+            return IsSelectedLine(lineIndex);
+
+        if (visualMode == VisualMode.Block)
+            return IsSelectedBlockLine(lineIndex)
+                && column >= Math.Min(anchorX, x)
+                && column <= Math.Max(anchorX, x);
+
+        if (lineIndex < Math.Min(anchorY, y) || lineIndex > Math.Max(anchorY, y))
+            return false;
+
+        if (anchorY == y)
+            return column >= Math.Min(anchorX, x) && column <= Math.Max(anchorX, x);
+
+        if (lineIndex == anchorY)
+            return column >= (anchorY < y ? anchorX : x);
+
+        if (lineIndex == y)
+            return column <= (anchorY < y ? x : anchorX);
+
+        return true;
+    }
+
+    static bool IsSelectedLine(int lineIndex) =>
+        lineIndex >= Math.Min(anchorY, y) && lineIndex <= Math.Max(anchorY, y);
+
+    static bool IsSelectedBlockLine(int lineIndex) => IsSelectedLine(lineIndex);
 
     static bool RunCommand()
     {
@@ -308,7 +437,7 @@ class MiniVim
                 string number = (lineIndex + 1).ToString().PadLeft(4) + " ";
                 output.Append("\x1b[90m").Append(number).Append("\x1b[0m");
                 int available = Math.Max(0, width - 5);
-                output.Append(line.Length > available ? line[..available] : line);
+                AppendLineWithSelection(output, line, lineIndex, available);
             }
             else
             {
@@ -317,7 +446,13 @@ class MiniVim
             output.Append("\x1b[K\r\n");
         }
 
-        string mode = insertMode ? "-- INSERT --" : "-- NORMAL --";
+        string mode = insertMode ? "-- INSERT --" : visualMode switch
+        {
+            VisualMode.Character => "-- VISUAL --",
+            VisualMode.Line => "-- VISUAL LINE --",
+            VisualMode.Block => "-- VISUAL BLOCK --",
+            _ => "-- NORMAL --"
+        };
         string name = string.IsNullOrEmpty(fileName) ? "[No Name]" : fileName;
         string status = $"{name}{(dirty ? " [+]" : "")}  |  {mode}  |  {y + 1}:{x + 1}";
         output.Append("\x1b[7m").Append(status.PadRight(width)[..width]).Append("\x1b[0m\r\n");
